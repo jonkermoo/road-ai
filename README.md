@@ -1,14 +1,14 @@
-## RoadAI
+# RoadAI
 
-# DJI Camera (RTMP Publisher)
+### DJI Camera (RTMP Publisher)
 
-# NGINX RTMP Server
+### NGINX RTMP Server
 
-# FastAPI
+### FastAPI
 
-# React Frontend
+### React Frontend
 
-# YoloV8
+### YoloV8
 
 This project sets up a real-time video streaming pipeline using a DJI Camera as
 an RTMP publisher and NGINX as an RTMP server. It will do live road assessments
