@@ -2,6 +2,9 @@ import os, time
 import cv2, numpy as np
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, PlainTextResponse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI(title="live-road-ai-min")
 
@@ -51,5 +54,5 @@ def video_feed():
     return StreamingResponse(mjpeg_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame")
 
-#$env:RTMP_URL = "RTMP_URL=rtmp://192.168.1.50/live/stream"
+
 #python -m uvicorn main:app --host 0.0.0.0 --port 8000
