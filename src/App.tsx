@@ -1,13 +1,14 @@
 function App() {
   return (
-    <div className="">
-      <div className="w-full max-w-4xl">
-        <h1 className="text-xl font-semibold mb-3 color-black">Live Stream</h1>
-        <div className="rounded-lg overflow-hidden border border-neutral-700">
-          <img src="/video-feed" alt="MJPEG Stream" />
-        </div>
-      </div>
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-500 text-white">
+      <h1 className="text-3xl font-bold mb-6">Live Stream</h1>
+      <img
+        src="/video-feed"
+        alt="MJPEG Stream"
+        className="border-4 border-gray-700 rounded-lg shadow-lg w-[640px] h-[480px] object-cover"
+      />
     </div>
   );
 }
+
 export default App;
