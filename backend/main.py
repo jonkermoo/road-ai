@@ -1,9 +1,17 @@
+import os
 import cv2
 import numpy as np
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI()
+
+RTMP = os.getenv("RTMP_URL")
+if not RTMP:
+    raise RuntimeError("RTMP URL NOT SET TO ENDPOINT")
+
 cap = cv2.VideoCapture(0)
 
 def mjpeg_frames():
@@ -26,3 +34,6 @@ def mjpeg_frames():
 def video_feed():
     return StreamingResponse(mjpeg_frames(),
       media_type="multipart/x-mixed-replace; boundary=frame")
+
+#$env:RTMP_URL = "RTMP_URL=rtmp://192.168.1.50/live/stream"
+#python -m uvicorn main:app --host 0.0.0.0 --port 8000
