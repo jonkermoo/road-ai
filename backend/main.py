@@ -1,19 +1,19 @@
-import os, time
+import os, time, threading
 import cv2, numpy as np
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from dotenv import load_dotenv
+from ultralytics import YOLO
 
 load_dotenv()
 
 app = FastAPI(title="live-road-ai-min")
 
-RTMP = os.getenv("RTMP_URL")  # e.g. rtmp://127.0.0.1/live/stream
+RTMP = os.getenv("RTMP_URL")  # e.g. rtmp://127.0.0.1/live/stream # 18.216.45.42
 if not RTMP:
     raise RuntimeError("Set RTMP_URL to your RTMP endpoint")
 
 def open_capture():
-    # RTMP needs FFMPEG backend
     return cv2.VideoCapture(RTMP, cv2.CAP_FFMPEG)
 
 cap = open_capture()
