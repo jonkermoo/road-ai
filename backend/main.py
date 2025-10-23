@@ -2,6 +2,7 @@ import os, time, threading
 import cv2, numpy as np
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware   
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
@@ -13,10 +14,23 @@ RTMP = os.getenv("RTMP_URL")  # e.g. rtmp://127.0.0.1/live/stream # 18.216.45.42
 if not RTMP:
     raise RuntimeError("Set RTMP_URL to your RTMP endpoint")
 
+YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
+YOLO_CONF   = float(os.getenv("YOLO_CONF", "0.25"))
+YOLO_IOU    = float(os.getenv("YOLO_IOU",  "0.45"))
+FRAME_MAX_W = int(os.getenv("FRAME_MAX_W", "960"))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 def open_capture():
     return cv2.VideoCapture(RTMP, cv2.CAP_FFMPEG)
 
 cap = open_capture()
+cap_lock = threading.Lock()
 
 @app.get("/health", response_class=PlainTextResponse)
 def health():
