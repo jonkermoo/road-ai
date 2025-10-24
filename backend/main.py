@@ -111,7 +111,7 @@ def mjpeg_frames():
             frame = _draw_boxes(frame, data, names)
 
         ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if not ok:
+        if ok:
             backoff = 0.5
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
         else:
