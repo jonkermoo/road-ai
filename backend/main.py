@@ -8,6 +8,12 @@ from ultralytics import YOLO
 
 load_dotenv()
 
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "reconnect;1|reconnect_streamed;1|reconnect_delay_max;2|"
+    "rw_timeout;5000000|stimeout;5000000|timeout;5000000"
+)
+
 app = FastAPI(title="live-road-ai-min")
 
 RTMP = os.getenv("RTMP_URL")  # e.g. rtmp://127.0.0.1/live/stream # 18.216.45.42
@@ -27,7 +33,9 @@ app.add_middleware(
 )
 
 def open_capture():
-    return cv2.VideoCapture(RTMP, cv2.CAP_FFMPEG)
+    cap = cv2.VideoCapture(RTMP, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+    return cap
 
 cap = open_capture()
 cap_lock = threading.Lock()
