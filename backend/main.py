@@ -1,4 +1,4 @@
-import os, time, threading
+import os, time, threading, signal
 import cv2, numpy as np
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
@@ -38,6 +38,22 @@ model = YOLO(YOLO_MODEL)
 last_dets = []
 last_dets_lock = threading.Lock()
 
+stop_event = threading.Event()
+
+#graceful shutdown on backend shutdown
+def _graceful_exit(*_):
+    stop_event.set()
+    with cap_lock:
+        if cap and cap.isOpened():
+            cap.release()
+
+signal.signal(signal.SIGINT, _graceful_exit)
+signal.signal(signal.SIGTERM, _graceful_exit)
+
+@app.on_event("shutdown")
+def on_shutdown():
+    _graceful_exit
+
 def _draw_boxes(image_bgr, boxes, names_lookup):
     for row in boxes:
         x1, y1, x2, y2, conf, cls_id = row.tolist()
@@ -72,50 +88,61 @@ def last_detections():
 def mjpeg_frames():
     global cap
     backoff = 0.5
-    while True:
-        if not cap.isOpened():
-            cap.release()
-            time.sleep(backoff)
-            cap = open_capture()
-            backoff = min(backoff * 2, 5.0)
-            black = np.zeros((360, 640, 3), dtype=np.uint8)
-            ok, jpg = cv2.imencode(".jpg", black)
+    try:
+        while not stop_event.is_set():
+            with cap_lock:
+                if not cap.isOpened():
+                    cap.release()
+                    time.sleep(backoff)
+                    if stop_event.is_set():
+                        break
+                    cap = open_capture()
+                    backoff = min(backoff * 2, 5.0)
+                    black = np.zeros((360, 640, 3), dtype=np.uint8)
+                    ok, jpg = cv2.imencode(".jpg", black)
+                    if ok:
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
+                    continue
+
+                ok, frame = cap.read()
+            if not ok:
+                with cap_lock:
+                    cap.release()
+                time.sleep(0.05)
+                continue
+
+            frame = _maybe_resize(frame)
+
+            results = model.predict(source=frame, conf=YOLO_CONF, iou=YOLO_IOU, verbose=False)
+            if results and results[0].boxes is not None and hasattr(results[0].boxes, "data"):
+                r = results[0]
+                data = r.boxes.data.cpu().numpy()
+                names = r.names
+
+                tmp = []
+                for row in data:
+                    x1, y1, x2, y2, conf, cls_id = row.tolist()
+                    tmp.append({
+                        "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
+                        "conf": float(conf), "cls": int(cls_id), "label": names.get(int(cls_id), str(int(cls_id)))
+                    })
+                with last_dets_lock:
+                    last_dets[:] = tmp
+
+                frame = _draw_boxes(frame, data, names)
+
+            ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if ok:
+                backoff = 0.5
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
-            continue
-
-        ok, frame = cap.read()
-        if not ok:
-            cap.release()
-            continue
-
-        frame = _maybe_resize(frame)
-
-        results = model.predict(source=frame, conf=YOLO_CONF, iou=YOLO_IOU, verbose=False)
-        dets = []
-        if results and results[0].boxes is not None and hasattr(results[0].boxes, "data"):
-            r = results[0]
-            data = r.boxes.data.cpu().numpy()
-            names = r.names
-
-            tmp = []
-            for row in data:
-                x1, y1, x2, y2, conf, cls_id = row.tolist()
-                tmp.append({
-                    "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
-                    "conf": float(conf), "cls": int(cls_id), "label": names.get(int(cls_id), str(int(cls_id)))
-                })
-            with last_dets_lock:
-                last_dets[:] = tmp
-
-            frame = _draw_boxes(frame, data, names)
-
-        ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if ok:
-            backoff = 0.5
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
-        else:
-            continue
+            else:
+                continue
+    except (GeneratorExit, BrokenPipeError):
+        pass
+    finally:
+        with cap_lock:
+            if cap and cap.isOpened():
+                cap.release()
 
 @app.get("/video-feed")
 def video_feed():
