@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ["police_car"]
+
+roboflow:
+  workspace: road-events
+  project: police-car-lqazp
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/road-events/police-car-lqazp/dataset/2

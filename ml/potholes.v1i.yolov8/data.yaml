@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['0']
+
+roboflow:
+  workspace: road-events
+  project: potholes-zk4zo-qyz0e
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/road-events/potholes-zk4zo-qyz0e/dataset/1

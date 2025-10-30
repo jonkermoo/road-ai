@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['road-sign']
+
+roboflow:
+  workspace: road-events
+  project: road-work-ahead-5jyg1
+  version: 2
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/road-events/road-work-ahead-5jyg1/dataset/2
