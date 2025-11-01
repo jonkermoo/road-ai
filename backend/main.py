@@ -1,30 +1,46 @@
-import os, time, threading, signal
-from collections import defaultdict
+import os, time, threading, signal, traceback
+from collections import deque
+from typing import Optional, List, Dict, Any
 import cv2, numpy as np
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from ultralytics import YOLO
 
+from supabase_io import upload_jpeg, insert_event
 
 load_dotenv()
+
+# OpenCV reconnect flags so RTMP auto-recovers if the stream drops.
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "reconnect;1|reconnect_streamed;1|reconnect_delay_max;2|"
     "rw_timeout;5000000|stimeout;5000000|timeout;5000000"
 )
 
+
+# 2) FastAPI
 app = FastAPI(title="live-road-ai")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Stream / Model configurations
 RTMP = os.getenv("RTMP_URL")
 if not RTMP:
     raise RuntimeError("Set RTMP_URL in backend/.env")
 
-MODEL_CFG = {
+# YOLO model configs
+MODEL_CFG: Dict[str, Dict[str, Any]] = {
     "police": {
-         "path": os.getenv("POLICE_MODEL"),
-        "conf": float(os.getenv("POLICE_CONF", "0.75")), 
+        "path": os.getenv("POLICE_MODEL"),
+        "conf": float(os.getenv("POLICE_CONF", "0.75")),
         "emit_conf": float(os.getenv("POLICE_EMIT_CONF", "0.98")),
         "color": (60, 170, 255),
         "fallback_label": "police",
@@ -61,7 +77,6 @@ MODEL_CFG = {
         "cooldown_s": float(os.getenv("ROADWORK_COOLDOWN_S", str(os.getenv("COOLDOWN_S", "15")))),
     },
 }
-
 for _name, _cfg in MODEL_CFG.items():
     _cfg.setdefault("emit_conf", _cfg.get("conf", 0.9))
     _cfg.setdefault("ar_min", 0.0)
@@ -78,16 +93,12 @@ MIN_BOX_PX     = int(os.getenv("MIN_BOX_PX", "9000"))
 ROI_YMIN_FRAC  = float(os.getenv("ROI_YMIN_FRAC", "0.20"))
 ROI_YMAX_FRAC  = float(os.getenv("ROI_YMAX_FRAC", "0.98"))
 
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-def open_capture():
+# Capture setup, self-healing
+def open_capture() -> cv2.VideoCapture:
+    """
+    Open the upstream stream with FFMPEG backend.
+    Reconnect flags are set via OPENCV_FFMPEG_CAPTURE_OPTIONS.
+    """
     cap = cv2.VideoCapture(RTMP, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
     return cap
@@ -95,7 +106,9 @@ def open_capture():
 cap = open_capture()
 cap_lock = threading.Lock()
 
-models = {}
+
+# load YOLO models
+models: Dict[str, YOLO] = {}
 for name, cfg in MODEL_CFG.items():
     path = cfg["path"]
     if not path or not os.path.exists(path):
@@ -112,11 +125,25 @@ for name, cfg in MODEL_CFG.items():
         pass
     models[name] = m
 
-last_dets = [] 
+# ==========================================
+# 6) Shared State: Detections, Tracks, Frames
+# ==========================================
+# These are for UI/debug endpoints (NOT the DB).
+last_dets: List[Dict[str, Any]] = []
 last_dets_lock = threading.Lock()
-_events = [] 
-_tracks = [] 
+_events: List[Dict[str, Any]] = []
+_events_lock = threading.Lock()
+
+# Simple track store for persistence gating (not full MOT)
+_tracks: List[Dict[str, Any]] = []
+
+# Graceful shutdown flag
 stop_event = threading.Event()
+
+# Keep a copy of the most recent frame for the event sinker snapshots
+latest_frame_lock = threading.Lock()
+latest_frame_bgr: Optional[np.ndarray] = None
+
 
 def _graceful_exit(*_):
     stop_event.set()
@@ -131,7 +158,10 @@ signal.signal(signal.SIGTERM, _graceful_exit)
 def on_shutdown():
     _graceful_exit()
 
-def _maybe_resize(frame):
+
+# utility helpers
+def _maybe_resize(frame: np.ndarray) -> np.ndarray:
+    """Optionally downscale width to FRAME_MAX_W for stable throughput."""
     if FRAME_MAX_W and FRAME_MAX_W > 0:
         h, w = frame.shape[:2]
         if w > FRAME_MAX_W:
@@ -139,7 +169,8 @@ def _maybe_resize(frame):
             frame = cv2.resize(frame, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
     return frame
 
-def _draw_boxes(image_bgr, dets):
+def _draw_boxes(image_bgr: np.ndarray, dets: List[Dict[str, Any]]) -> np.ndarray:
+    """Draw labeled boxes (for /video-feed debugging)."""
     for d in dets:
         x1, y1, x2, y2 = map(int, [d["x1"], d["y1"], d["x2"], d["y2"]])
         label = f'{d["label"]} {d["conf"]:.2f}'
@@ -149,9 +180,26 @@ def _draw_boxes(image_bgr, dets):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
     return image_bgr
 
-def _infer_all(frame):
-    """Run each model and return list of detections above its DRAW threshold."""
-    merged = []
+def _area(b):
+    return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
+
+def _aspect_ratio(b):
+    """Return width/height ratio of (x1, y1, x2, y2)."""
+    w = max(1, b[2] - b[0]); h = max(1, b[3] - b[1])
+    return w / h
+
+def _iou(a,b):
+    ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
+    ix1,iy1 = max(ax1,bx1), max(ay1,by1)
+    ix2,iy2 = min(ax2,bx2), min(ay2,by2)
+    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
+    inter = iw*ih
+    ua = _area(a) + _area(b) - inter
+    return inter/ua if ua > 0 else 0.0
+
+# post-processing
+def _infer_all(frame: np.ndarray) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
     ts = time.time()
     H, W = frame.shape[:2]
     for name, mdl in models.items():
@@ -175,31 +223,11 @@ def _infer_all(frame):
                 "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
                 "color": cfg["color"],
                 "ts": ts,
-                "_img_h": H,
-                "_img_w": W,
+                "_img_h": H, "_img_w": W,
             })
     return merged
 
-def _area(b):
-    return max(0, b[2]-b[0]) * max(0, b[3]-b[1])
-
-def _aspect_ratio(b):
-    """Return width/height ratio of a bounding box tuple (x1, y1, x2, y2)."""
-    w = max(1, b[2] - b[0])
-    h = max(1, b[3] - b[1])
-    return w / h
-
-def _iou(a,b):
-    ax1,ay1,ax2,ay2 = a; bx1,by1,bx2,by2 = b
-    ix1,iy1 = max(ax1,bx1), max(ay1,by1)
-    ix2,iy2 = min(ax2,bx2), min(ay2,by2)
-    iw, ih = max(0, ix2-ix1), max(0, iy2-iy1)
-    inter = iw*ih
-    ua = _area(a) + _area(b) - inter
-    return inter/ua if ua > 0 else 0.0
-
-def _match_track(d):
-    """Return index of a matching track in _tracks or -1."""
+def _match_track(d) -> int:
     best_i, best_iou = -1, 0.0
     cand = (int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"]))
     for i, t in enumerate(_tracks):
@@ -210,15 +238,15 @@ def _match_track(d):
             best_i, best_iou = i, iou
     return best_i if best_iou >= PERSIST_IOU else -1
 
-def _passes_emit_rules(d):
+def _passes_emit_rules(d) -> bool:
     cfg = MODEL_CFG[d["model"]]
 
-    # conf gate (use emit_conf if present, else fall back to conf, else 0.9)
+    # 1) Confidence gate (stricter emit_conf than draw/conf)
     emit_conf = float(cfg.get("emit_conf", cfg.get("conf", 0.9)))
     if d["conf"] < emit_conf:
         return False
 
-    # size gates (area + w/h)
+    # 2) Size gates (area + w/h)
     box = (int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"]))
     min_box_px = int(cfg.get("min_box_px", MIN_BOX_PX))
     if _area(box) < min_box_px:
@@ -229,35 +257,36 @@ def _passes_emit_rules(d):
     if (min_w and w < min_w) or (min_h and h < min_h):
         return False
 
-    # aspect-ratio gate (use wide-open defaults if not provided)
+    # 3) Aspect-ratio gate
     ar_min = float(cfg.get("ar_min", 0.0))
     ar_max = float(cfg.get("ar_max", 9.0))
     ar = _aspect_ratio(box)
     if not (ar_min <= ar <= ar_max):
         return False
-    
-    # ROI gate (ignore boxes too high/low in the frame)
+
+    # 4) ROI gate (reject too high/low boxes)
     ymid = (box[1] + box[3]) * 0.5
-    # store image height on the detection once per frame in _infer_all
     H = d.get("_img_h", None)
     if H:
         yf = ymid / float(H)
         if not (ROI_YMIN_FRAC <= yf <= ROI_YMAX_FRAC):
             return False
-    
 
     return True
 
-def _update_tracks_and_emit(detections):
-    """Update persistence tracker with current detections and emit stable events."""
+# emits events only after certain requirements met
+def _update_tracks_and_emit(detections: List[Dict[str, Any]]) -> None:
+    with _events_lock:
+        _events.append(payload)
+
     now = time.time()
 
-    # 1) decay stale tracks a bit so they drop off if they vanish
+    # 1) Decay stale tracks (so they drop if they vanish)
     for t in _tracks:
         if now - t["last_ts"] > 2.0:
             t["hits"] = max(0, t["hits"] - 1)
 
-    # 2) incorporate detections that PASS strict event rules
+    # 2) Incorporate detections that PASS strict emit rules
     for d in detections:
         if not _passes_emit_rules(d):
             continue
@@ -281,7 +310,7 @@ def _update_tracks_and_emit(detections):
             t["last_ts"] = now
             t["conf"] = max(t["conf"], d["conf"])
 
-    # 3) emit events only for stable tracks that respect cooldown
+    # emit events only for stable tracks that respect cooldown
     for t in _tracks:
         cfg = MODEL_CFG.get(t["model"], {})
         need_hits = int(cfg.get("persist_frames", PERSIST_FRAMES))
@@ -297,14 +326,115 @@ def _update_tracks_and_emit(detections):
             _events.append(payload)
             t["sent_ts"] = now
 
-    # 4) prune tracks that went stale
-        _tracks[:] = [
+            with eventq_lock:
+                event_queue.append({"label": t["label"]})
+
+    _tracks[:] = [
         t for t in _tracks
         if (now - t["last_ts"] < 3.0) or (t["hits"] >= 2)
     ]
 
+# Event Sync, decouple network I/O (Supabase) from real-time loop.
+event_queue = deque(maxlen=1000)
+eventq_lock = threading.Lock()
 
+# dequeues emitted items and uploads latest frame to Supabase
+def _event_sink_worker():
+    while not stop_event.is_set():
+        item = None
+        with eventq_lock:
+            if event_queue:
+                item = event_queue.popleft()
+        if item is None:
+            time.sleep(0.02)
+            continue
 
+        label = item["label"]
+        try:
+            snap = None
+            with latest_frame_lock:
+                if latest_frame_bgr is not None:
+                    snap = latest_frame_bgr.copy()
+
+            img_url = None
+            if snap is not None:
+                ok, jpg = cv2.imencode(".jpg", snap, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok:
+                    img_url = upload_jpeg(jpg.tobytes())
+
+            insert_event(evt_type=label, img_url=img_url)
+
+        except Exception as e:
+            print("[warn] event_sink failed:", e)
+            traceback.print_exc()
+
+sink_thread = threading.Thread(target=_event_sink_worker, daemon=True)
+sink_thread.start()
+
+# video endpoint, draws boxes and keeps safe copy of latest frame
+def mjpeg_frames():
+    global cap, latest_frame_bgr
+    backoff = 0.5
+    try:
+        while not stop_event.is_set():
+            # read frame (with reconnects)
+            with cap_lock:
+                if not cap.isOpened():
+                    cap.release()
+                    time.sleep(backoff)
+                    if stop_event.is_set():
+                        break
+                    cap = open_capture()
+                    backoff = min(backoff * 2, 5.0)
+                    # yield a black frame while reconnecting (keeps clients connected)
+                    black = np.zeros((360, 640, 3), dtype=np.uint8)
+                    ok, jpg = cv2.imencode(".jpg", black)
+                    if ok:
+                        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
+                    continue
+
+                ok, frame = cap.read()
+            if not ok:
+                with cap_lock:
+                    cap.release()
+                time.sleep(0.05)
+                continue
+
+            frame = _maybe_resize(frame)
+
+            with latest_frame_lock:
+                latest_frame_bgr = frame.copy()
+
+            dets = _infer_all(frame)
+
+            strong_for_draw = [
+                d for d in dets
+                if d["conf"] >= MODEL_CFG[d["model"]]["conf"]
+                and _area((int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"]))) >= MIN_BOX_PX
+            ]
+
+            if strong_for_draw:
+                _update_tracks_and_emit(strong_for_draw)
+
+            with last_dets_lock:
+                last_dets[:] = strong_for_draw
+
+            out = frame
+            if strong_for_draw:
+                out = _draw_boxes(out, strong_for_draw)
+
+            ok, jpg = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if ok:
+                backoff = 0.5
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
+    except (GeneratorExit, BrokenPipeError):
+        pass
+    finally:
+        with cap_lock:
+            if cap and cap.isOpened():
+                cap.release()
+
+# API endpoints
 @app.get("/health", response_class=PlainTextResponse)
 def health():
     with cap_lock:
@@ -322,74 +452,13 @@ def last_detections():
 
 @app.get("/events")
 def events():
-    return JSONResponse(_events[-100:])
-
-def mjpeg_frames():
-    global cap
-    backoff = 0.5
-    try:
-        while not stop_event.is_set():
-            # --- read frame (with reconnects) ---
-            with cap_lock:
-                if not cap.isOpened():
-                    cap.release()
-                    time.sleep(backoff)
-                    if stop_event.is_set():
-                        break
-                    cap = open_capture()
-                    backoff = min(backoff * 2, 5.0)
-                    # yield a black frame while reconnecting
-                    black = np.zeros((360, 640, 3), dtype=np.uint8)
-                    ok, jpg = cv2.imencode(".jpg", black)
-                    if ok:
-                        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
-                    continue
-
-                ok, frame = cap.read()
-            if not ok:
-                with cap_lock:
-                    cap.release()
-                time.sleep(0.05)
-                continue
-
-            frame = _maybe_resize(frame)
-
-            # --- inference ---
-            dets = _infer_all(frame)
-
-            # Only keep detections above the model's DRAW threshold
-            strong_for_draw = [
-                d for d in dets
-                if d["conf"] >= MODEL_CFG[d["model"]]["conf"]
-                and _area((int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"]))) >= MIN_BOX_PX
-            ]
-
-            # Update persistence & possibly emit events (extra strict)
-            if strong_for_draw:
-                _update_tracks_and_emit(strong_for_draw)
-
-            # expose latest drawn dets to /last-dets (for debugging/UI)
-            with last_dets_lock:
-                last_dets[:] = strong_for_draw
-
-            # --- draw and send ---
-            if strong_for_draw:
-                frame = _draw_boxes(frame, strong_for_draw)
-
-            ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            if ok:
-                backoff = 0.5
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n"
-    except (GeneratorExit, BrokenPipeError):
-        pass
-    finally:
-        with cap_lock:
-            if cap and cap.isOpened():
-                cap.release()
+    with _events_lock:
+        return JSONResponse(_events[-100:])
 
 @app.get("/video-feed")
 def video_feed():
     return StreamingResponse(mjpeg_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame")
+
 
 # run:  python -m uvicorn main:app --host 0.0.0.0 --port 8000
