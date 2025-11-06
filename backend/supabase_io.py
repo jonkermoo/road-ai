@@ -25,8 +25,8 @@ def upload_jpeg(jpg_bytes: bytes, key: Optional[str] = None) -> str:
         raise RuntimeError(f"Supabase upload failed: {r.status_code} {r.text}")
     return _public_url(SUPABASE_BUCKET, key)
 
-def insert_event(evt_type: str, img_url: Optional[str]) -> None:
-    """Insert minimal event row into 'events' (id auto, ts default now())."""
+def insert_event(evt_type: str, img_url: Optional[str], lat: Optional[float] = None, lng: Optional[float] = None) -> None:
+    """Insert event row into 'events' with optional lat/lng coordinates."""
     url = f"{SUPABASE_URL}/rest/v1/events"
     headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -38,6 +38,8 @@ def insert_event(evt_type: str, img_url: Optional[str]) -> None:
         "ts": datetime.now(timezone.utc).isoformat(),
         "type": evt_type,
         "img_url": img_url,
+        "lat": lat,
+        "lng": lng,
     }
     r = _session.post(url, headers=headers, data=json.dumps(payload), timeout=15)
     if r.status_code not in (200, 201, 204):
