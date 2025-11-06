@@ -3,12 +3,12 @@ from collections import deque
 from typing import Optional, List, Dict, Any
 import cv2, numpy as np
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from ultralytics import YOLO
-
 from supabase_io import upload_jpeg, insert_event
 
 load_dotenv()
@@ -143,6 +143,15 @@ stop_event = threading.Event()
 # Keep a copy of the most recent frame for the event sinker snapshots
 latest_frame_lock = threading.Lock()
 latest_frame_bgr: Optional[np.ndarray] = None
+
+# ==========================================
+# 7) Session Management & Location Tracking
+# ==========================================
+# Tracks the active device session and current GPS location
+active_session: Optional[Dict[str, Any]] = None
+active_session_lock = threading.Lock()
+current_location: Optional[Dict[str, float]] = None  # {"lat": ..., "lng": ...}
+location_lock = threading.Lock()
 
 
 def _graceful_exit(*_):
@@ -362,7 +371,14 @@ def _event_sink_worker():
                 if ok:
                     img_url = upload_jpeg(jpg.tobytes())
 
-            insert_event(evt_type=label, img_url=img_url)
+            # Get current location if available
+            lat, lng = None, None
+            with location_lock:
+                if current_location:
+                    lat = current_location.get("lat")
+                    lng = current_location.get("lng")
+
+            insert_event(evt_type=label, img_url=img_url, lat=lat, lng=lng)
 
         except Exception as e:
             print("[warn] event_sink failed:", e)
@@ -434,7 +450,102 @@ def mjpeg_frames():
             if cap and cap.isOpened():
                 cap.release()
 
-# API endpoints
+# ==========================================
+# 8) Pydantic Models for API
+# ==========================================
+class SessionClaim(BaseModel):
+    device_id: str
+
+class LocationUpdate(BaseModel):
+    lat: float
+    lng: float
+
+# ==========================================
+# 9) API Endpoints
+# ==========================================
+
+# Session Management Endpoints
+@app.post("/session/claim")
+def claim_session(claim: SessionClaim):
+    """Claim the active session. Only one device can be active at a time."""
+    global active_session
+    with active_session_lock:
+        now = time.time()
+        # Check if there's already an active session
+        if active_session:
+            # Allow re-claim if same device OR if session is stale (>30s)
+            if active_session["device_id"] == claim.device_id:
+                active_session["last_heartbeat"] = now
+                return {"success": True, "message": "Session renewed"}
+            elif now - active_session["last_heartbeat"] > 30:
+                # Stale session, allow takeover
+                active_session = {"device_id": claim.device_id, "claimed_at": now, "last_heartbeat": now}
+                return {"success": True, "message": "Session claimed (previous session expired)"}
+            else:
+                raise HTTPException(status_code=409, detail="Another device is already streaming")
+
+        # No active session, claim it
+        active_session = {"device_id": claim.device_id, "claimed_at": now, "last_heartbeat": now}
+        return {"success": True, "message": "Session claimed"}
+
+@app.post("/session/heartbeat")
+def session_heartbeat(claim: SessionClaim):
+    """Send heartbeat to keep session alive."""
+    global active_session
+    with active_session_lock:
+        if not active_session or active_session["device_id"] != claim.device_id:
+            raise HTTPException(status_code=403, detail="No active session or device mismatch")
+        active_session["last_heartbeat"] = time.time()
+        return {"success": True}
+
+@app.post("/session/release")
+def release_session(claim: SessionClaim):
+    """Release the active session."""
+    global active_session, current_location
+    with active_session_lock:
+        if active_session and active_session["device_id"] == claim.device_id:
+            active_session = None
+            with location_lock:
+                current_location = None
+            return {"success": True, "message": "Session released"}
+        return {"success": False, "message": "No active session or device mismatch"}
+
+@app.get("/session/status")
+def session_status():
+    """Check if there's an active session."""
+    with active_session_lock:
+        if active_session:
+            return {
+                "active": True,
+                "device_id": active_session["device_id"],
+                "claimed_at": active_session["claimed_at"],
+                "last_heartbeat": active_session["last_heartbeat"]
+            }
+        return {"active": False}
+
+# Location Update Endpoint
+@app.post("/update-location")
+def update_location(location: LocationUpdate, device_id: str):
+    """Receive location updates from the active device."""
+    global current_location
+    with active_session_lock:
+        if not active_session or active_session["device_id"] != device_id:
+            raise HTTPException(status_code=403, detail="Not the active device")
+
+    with location_lock:
+        current_location = {"lat": location.lat, "lng": location.lng}
+
+    return {"success": True}
+
+@app.get("/current-location")
+def get_current_location():
+    """Get the current GPS location."""
+    with location_lock:
+        if current_location:
+            return current_location
+        return {"lat": None, "lng": None}
+
+# Existing API endpoints
 @app.get("/health", response_class=PlainTextResponse)
 def health():
     with cap_lock:
