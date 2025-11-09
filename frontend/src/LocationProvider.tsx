@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from "react";
+import { BACKEND_URL } from "./config";
 
 interface LocationProviderProps {
   deviceId: string | null;
@@ -23,7 +24,7 @@ export function LocationProvider({
     if (!deviceId || !isActive) return;
 
     try {
-      await fetch(`/update-location?device_id=${deviceId}`, {
+      await fetch(`${BACKEND_URL}/update-location?device_id=${deviceId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ lat, lng }),

@@ -1,18 +1,24 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef } from "react";
+import { BACKEND_URL } from "./config";
 
 interface SessionManagerProps {
   onSessionClaimed: (deviceId: string) => void;
   onSessionLost: () => void;
 }
 
-export function SessionManager({ onSessionClaimed, onSessionLost }: SessionManagerProps) {
-  const [status, setStatus] = useState<'idle' | 'claiming' | 'active' | 'blocked'>('idle');
+export function SessionManager({
+  onSessionClaimed,
+  onSessionLost,
+}: SessionManagerProps) {
+  const [status, setStatus] = useState<
+    "idle" | "claiming" | "active" | "blocked"
+  >("idle");
   const [deviceId] = useState(() => {
     // Generate or retrieve device ID from localStorage
-    let id = localStorage.getItem('device_id');
+    let id = localStorage.getItem("device_id");
     if (!id) {
       id = `device_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      localStorage.setItem('device_id', id);
+      localStorage.setItem("device_id", id);
     }
     return id;
   });
@@ -20,44 +26,44 @@ export function SessionManager({ onSessionClaimed, onSessionLost }: SessionManag
   const heartbeatIntervalRef = useRef<number | null>(null);
 
   const claimSession = async () => {
-    setStatus('claiming');
+    setStatus("claiming");
     try {
-      const res = await fetch('/session/claim', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_id: deviceId })
+      const res = await fetch(`${BACKEND_URL}/session/claim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId }),
       });
 
       if (res.ok) {
-        setStatus('active');
+        setStatus("active");
         onSessionClaimed(deviceId);
         startHeartbeat();
       } else if (res.status === 409) {
-        setStatus('blocked');
+        setStatus("blocked");
         onSessionLost();
       }
     } catch (error) {
-      console.error('Failed to claim session:', error);
-      setStatus('idle');
+      console.error("Failed to claim session:", error);
+      setStatus("idle");
     }
   };
 
   const sendHeartbeat = async () => {
     try {
-      const res = await fetch('/session/heartbeat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_id: deviceId })
+      const res = await fetch(`${BACKEND_URL}/session/heartbeat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId }),
       });
 
       if (!res.ok) {
-        console.error('Heartbeat failed');
+        console.error("Heartbeat failed");
         stopHeartbeat();
-        setStatus('idle');
+        setStatus("idle");
         onSessionLost();
       }
     } catch (error) {
-      console.error('Heartbeat error:', error);
+      console.error("Heartbeat error:", error);
     }
   };
 
@@ -76,15 +82,15 @@ export function SessionManager({ onSessionClaimed, onSessionLost }: SessionManag
   const releaseSession = async () => {
     stopHeartbeat();
     try {
-      await fetch('/session/release', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_id: deviceId })
+      await fetch(`${BACKEND_URL}/session/release`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId }),
       });
-      setStatus('idle');
+      setStatus("idle");
       onSessionLost();
     } catch (error) {
-      console.error('Failed to release session:', error);
+      console.error("Failed to release session:", error);
     }
   };
 
@@ -94,7 +100,7 @@ export function SessionManager({ onSessionClaimed, onSessionLost }: SessionManag
 
     // Cleanup on unmount
     return () => {
-      if (status === 'active') {
+      if (status === "active") {
         releaseSession();
       }
     };
@@ -105,10 +111,12 @@ export function SessionManager({ onSessionClaimed, onSessionLost }: SessionManag
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-lg font-semibold">Session Status</h3>
-          <p className="text-sm text-gray-400">Device ID: {deviceId.substring(0, 20)}...</p>
+          <p className="text-sm text-gray-400">
+            Device ID: {deviceId.substring(0, 20)}...
+          </p>
         </div>
         <div className="flex items-center gap-2">
-          {status === 'idle' && (
+          {status === "idle" && (
             <button
               onClick={claimSession}
               className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded"
@@ -116,10 +124,10 @@ export function SessionManager({ onSessionClaimed, onSessionLost }: SessionManag
               Connect
             </button>
           )}
-          {status === 'claiming' && (
+          {status === "claiming" && (
             <span className="text-yellow-400">Connecting...</span>
           )}
-          {status === 'active' && (
+          {status === "active" && (
             <>
               <span className="text-green-400 flex items-center gap-2">
                 <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></span>
@@ -133,7 +141,7 @@ export function SessionManager({ onSessionClaimed, onSessionLost }: SessionManag
               </button>
             </>
           )}
-          {status === 'blocked' && (
+          {status === "blocked" && (
             <span className="text-red-400">Another device is streaming</span>
           )}
         </div>
