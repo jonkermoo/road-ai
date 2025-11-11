@@ -36,6 +36,9 @@ RTMP = os.getenv("RTMP_URL")
 if not RTMP:
     raise RuntimeError("Set RTMP_URL in backend/.env")
 
+# Frame skipping for performance: process YOLO every N frames
+PROCESS_EVERY_N_FRAMES = int(os.getenv("PROCESS_EVERY_N_FRAMES", "3"))
+
 # YOLO model configs
 MODEL_CFG: Dict[str, Dict[str, Any]] = {
     "police": {
@@ -97,8 +100,11 @@ ROI_YMAX_FRAC  = float(os.getenv("ROI_YMAX_FRAC", "0.98"))
 def open_capture() -> cv2.VideoCapture:
     """
     Open the upstream stream with FFMPEG backend.
-    Try without explicit backend first, then with CAP_FFMPEG.
+    Set environment variables to help FFMPEG connect.
     """
+    # Set FFMPEG options via environment variable
+    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtmp_transport;tcp|rtmp_buffer;1000000'
+
     # Try opening without specifying backend (auto-detect)
     cap = cv2.VideoCapture(RTMP)
     if cap.isOpened():
@@ -396,6 +402,9 @@ sink_thread.start()
 def mjpeg_frames():
     global cap, latest_frame_bgr
     backoff = 0.5
+    frame_count = 0
+    last_detections = []  # Cache detections from last processed frame
+
     try:
         while not stop_event.is_set():
             # read frame (with reconnects)
@@ -422,23 +431,31 @@ def mjpeg_frames():
                 continue
 
             frame = _maybe_resize(frame)
+            frame_count += 1
 
             with latest_frame_lock:
                 latest_frame_bgr = frame.copy()
 
-            dets = _infer_all(frame)
+            # Frame skipping: only run YOLO every N frames
+            if frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                dets = _infer_all(frame)
 
-            strong_for_draw = [
-                d for d in dets
-                if d["conf"] >= MODEL_CFG[d["model"]]["conf"]
-                and _area((int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"]))) >= MIN_BOX_PX
-            ]
+                strong_for_draw = [
+                    d for d in dets
+                    if d["conf"] >= MODEL_CFG[d["model"]]["conf"]
+                    and _area((int(d["x1"]), int(d["y1"]), int(d["x2"]), int(d["y2"]))) >= MIN_BOX_PX
+                ]
 
-            if strong_for_draw:
-                _update_tracks_and_emit(strong_for_draw)
+                if strong_for_draw:
+                    _update_tracks_and_emit(strong_for_draw)
 
-            with last_dets_lock:
-                last_dets[:] = strong_for_draw
+                last_detections = strong_for_draw  # Cache for skipped frames
+
+                with last_dets_lock:
+                    last_dets[:] = strong_for_draw
+            else:
+                # Reuse cached detections from last processed frame
+                strong_for_draw = last_detections
 
             out = frame
             if strong_for_draw:
