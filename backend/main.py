@@ -97,8 +97,15 @@ ROI_YMAX_FRAC  = float(os.getenv("ROI_YMAX_FRAC", "0.98"))
 def open_capture() -> cv2.VideoCapture:
     """
     Open the upstream stream with FFMPEG backend.
-    Reconnect flags are set via OPENCV_FFMPEG_CAPTURE_OPTIONS.
+    Try without explicit backend first, then with CAP_FFMPEG.
     """
+    # Try opening without specifying backend (auto-detect)
+    cap = cv2.VideoCapture(RTMP)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        return cap
+
+    # Fallback: try with explicit FFMPEG backend
     cap = cv2.VideoCapture(RTMP, cv2.CAP_FFMPEG)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
     return cap
