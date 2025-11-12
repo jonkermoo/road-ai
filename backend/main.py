@@ -39,14 +39,17 @@ if not RTMP:
 # Frame skipping for performance: process YOLO every N frames
 PROCESS_EVERY_N_FRAMES = int(os.getenv("PROCESS_EVERY_N_FRAMES", "3"))
 
-# YOLO model configs
-MODEL_CFG: Dict[str, Dict[str, Any]] = {
+# Combined YOLO model configuration
+# Single model detects all 3 classes: police, pothole, roadwork
+COMBINED_MODEL_PATH = os.getenv("COMBINED_MODEL", "../ml/runs/detect/combined_road_ai/weights/best.pt")
+
+# Per-class detection configs (conf, emit_conf, colors, filters)
+# Class IDs: 0=police, 1=pothole, 2=roadwork (from combined model training)
+CLASS_CFG: Dict[str, Dict[str, Any]] = {
     "police": {
-        "path": os.getenv("POLICE_MODEL"),
         "conf": float(os.getenv("POLICE_CONF", "0.75")),
         "emit_conf": float(os.getenv("POLICE_EMIT_CONF", "0.98")),
         "color": (60, 170, 255),
-        "fallback_label": "police",
         "ar_min": float(os.getenv("POLICE_AR_MIN", "1.40")),
         "ar_max": float(os.getenv("POLICE_AR_MAX", "3.50")),
         "min_box_px": int(os.getenv("POLICE_MIN_BOX_PX", "70000")),
@@ -56,11 +59,9 @@ MODEL_CFG: Dict[str, Dict[str, Any]] = {
         "cooldown_s": float(os.getenv("POLICE_COOLDOWN_S", "25")),
     },
     "pothole": {
-        "path": os.getenv("POTHOLE_MODEL"),
         "conf": float(os.getenv("POTHOLE_CONF", "0.75")),
         "emit_conf": float(os.getenv("POTHOLE_EMIT_CONF", "0.90")),
         "color": (90, 220, 100),
-        "fallback_label": "pothole",
         "ar_min": float(os.getenv("POTHOLE_AR_MIN", "0.0")),
         "ar_max": float(os.getenv("POTHOLE_AR_MAX", "9.0")),
         "min_box_px": int(os.getenv("POTHOLE_MIN_BOX_PX", str(os.getenv("MIN_BOX_PX", "40000")))),
@@ -68,11 +69,9 @@ MODEL_CFG: Dict[str, Dict[str, Any]] = {
         "cooldown_s": float(os.getenv("POTHOLE_COOLDOWN_S", str(os.getenv("COOLDOWN_S", "15")))),
     },
     "roadwork": {
-        "path": os.getenv("ROADWORK_MODEL"),
         "conf": float(os.getenv("ROADWORK_CONF", "0.75")),
         "emit_conf": float(os.getenv("ROADWORK_EMIT_CONF", "0.90")),
         "color": (255, 120, 60),
-        "fallback_label": "roadwork",
         "ar_min": float(os.getenv("ROADWORK_AR_MIN", "0.75")),
         "ar_max": float(os.getenv("ROADWORK_AR_MAX", "1.33")),
         "min_box_px": int(os.getenv("ROADWORK_MIN_BOX_PX", str(os.getenv("MIN_BOX_PX", "40000")))),
@@ -80,10 +79,13 @@ MODEL_CFG: Dict[str, Dict[str, Any]] = {
         "cooldown_s": float(os.getenv("ROADWORK_COOLDOWN_S", str(os.getenv("COOLDOWN_S", "15")))),
     },
 }
-for _name, _cfg in MODEL_CFG.items():
+for _name, _cfg in CLASS_CFG.items():
     _cfg.setdefault("emit_conf", _cfg.get("conf", 0.9))
     _cfg.setdefault("ar_min", 0.0)
     _cfg.setdefault("ar_max", 9.0)
+
+# Backward compatibility: MODEL_CFG is now CLASS_CFG
+MODEL_CFG = CLASS_CFG
 
 YOLO_IOU    = float(os.getenv("YOLO_IOU",  "0.45"))
 FRAME_MAX_W = int(os.getenv("FRAME_MAX_W", "960"))
@@ -120,23 +122,22 @@ cap = open_capture()
 cap_lock = threading.Lock()
 
 
-# load YOLO models
-models: Dict[str, YOLO] = {}
-for name, cfg in MODEL_CFG.items():
-    path = cfg["path"]
-    if not path or not os.path.exists(path):
-        raise FileNotFoundError(f"Model '{name}' not found at: {path}")
-    m = YOLO(path)
-    try:
-        if list(getattr(m, "names", {}).values()) == ["0"]:
-            m.names = {0: cfg["fallback_label"]}
-    except Exception:
-        pass
-    try:
-        m.fuse()
-    except Exception:
-        pass
-    models[name] = m
+# Load single combined YOLO model
+if not os.path.exists(COMBINED_MODEL_PATH):
+    raise FileNotFoundError(f"Combined model not found at: {COMBINED_MODEL_PATH}")
+
+combined_model = YOLO(COMBINED_MODEL_PATH)
+try:
+    combined_model.fuse()
+except Exception:
+    pass
+
+# Verify model has expected class names
+expected_classes = ["police", "pothole", "roadwork"]
+model_classes = list(combined_model.names.values())
+print(f"Loaded combined model with classes: {model_classes}")
+if model_classes != expected_classes:
+    print(f"WARNING: Expected {expected_classes}, got {model_classes}")
 
 
 # Shared State: Detections, Tracks, Frames
@@ -219,33 +220,53 @@ def _iou(a,b):
 
 # post-processing
 def _infer_all(frame: np.ndarray) -> List[Dict[str, Any]]:
-    merged: List[Dict[str, Any]] = []
+    """Run combined model inference and categorize detections by class."""
+    detections: List[Dict[str, Any]] = []
     ts = time.time()
     H, W = frame.shape[:2]
-    for name, mdl in models.items():
-        cfg = MODEL_CFG[name]
-        res = mdl.predict(frame, conf=cfg["conf"], iou=YOLO_IOU, verbose=False)
-        if not res:
+
+    # Run single combined model (detects all 3 classes at once)
+    # Use minimum confidence across all classes
+    min_conf = min(cfg["conf"] for cfg in CLASS_CFG.values())
+    res = combined_model.predict(frame, conf=min_conf, iou=YOLO_IOU, verbose=False)
+
+    if not res:
+        return detections
+
+    r = res[0]
+    if r.boxes is None or not hasattr(r.boxes, "data"):
+        return detections
+
+    data = r.boxes.data.cpu().numpy()
+    names = r.names or {}
+
+    # Process each detection and route to correct class
+    for row in data:
+        x1, y1, x2, y2, conf, cls_id = row.tolist()
+        label = names.get(int(cls_id), "unknown")
+
+        # Get class-specific config (use label name to look up config)
+        if label not in CLASS_CFG:
+            continue  # Skip unknown classes
+
+        cfg = CLASS_CFG[label]
+
+        # Apply class-specific confidence threshold
+        if conf < cfg["conf"]:
             continue
-        r = res[0]
-        if r.boxes is None or not hasattr(r.boxes, "data"):
-            continue
-        data = r.boxes.data.cpu().numpy()
-        names = r.names or {}
-        for row in data:
-            x1, y1, x2, y2, conf, cls_id = row.tolist()
-            label = names.get(int(cls_id), cfg["fallback_label"])
-            merged.append({
-                "model": name,
-                "label": label,
-                "cls": int(cls_id),
-                "conf": float(conf),
-                "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
-                "color": cfg["color"],
-                "ts": ts,
-                "_img_h": H, "_img_w": W,
-            })
-    return merged
+
+        detections.append({
+            "model": label,  # Use label as "model" for backward compatibility
+            "label": label,
+            "cls": int(cls_id),
+            "conf": float(conf),
+            "x1": float(x1), "y1": float(y1), "x2": float(x2), "y2": float(y2),
+            "color": cfg["color"],
+            "ts": ts,
+            "_img_h": H, "_img_w": W,
+        })
+
+    return detections
 
 def _match_track(d) -> int:
     best_i, best_iou = -1, 0.0
@@ -573,7 +594,12 @@ def health():
 
 @app.get("/models")
 def models_info():
-    return {k: {"path": v["path"], "conf": v["conf"]} for k, v in MODEL_CFG.items()}
+    return {
+        "model_type": "combined",
+        "model_path": COMBINED_MODEL_PATH,
+        "classes": list(CLASS_CFG.keys()),
+        "class_configs": {k: {"conf": v["conf"], "emit_conf": v["emit_conf"]} for k, v in CLASS_CFG.items()}
+    }
 
 @app.get("/last-dets")
 def last_detections():
